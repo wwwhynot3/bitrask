@@ -1,0 +1,12 @@
+[package]
+name = "bitrask"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+"crc32fast" = "*"
+"tokio" = { version = "*", features = ["full"] }
+serde = { version = "*", features = ["derive"] }
+bincode = "*"
+"scc" = { version = "*", "features" = ["serde"] }

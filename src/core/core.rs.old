@@ -1,0 +1,106 @@
+#![allow(unused)]
+use crate::core::util::CrcCalculator;
+use core::{hash, time};
+use serde::{Deserialize, Serialize};
+use std::{
+    io::Read,
+    str::Bytes,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+/**
+ * A block is a key-value pair, where the key and value are both byte arrays.
+ */
+#[derive(Serialize, Deserialize)]
+struct Block<'a> {
+    timestamp: u64,
+    key_size: u64,
+    data_size: u64,
+    key: &'a [u8],
+    data: &'a [u8],
+}
+impl Block<'_> {
+    pub fn new<'a>(key: &'a [u8], data: &'a [u8]) -> Block<'a> {
+        Self::new_with_params(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs(),
+            key.len() as u64,
+            data.len() as u64,
+            key,
+            data,
+        )
+    }
+    pub fn new_with_params<'a>(
+        timestamp: u64,
+        key_size: u64,
+        data_size: u64,
+        key: &'a [u8],
+        data: &'a [u8],
+    ) -> Block<'a> {
+        Block {
+            timestamp,
+            key_size,
+            data_size,
+            key,
+            data,
+        }
+    }
+}
+/**
+ * A file block is a block with a CRC32 checksum.
+ */
+pub struct FileBlock<'a> {
+    crc: u32,
+    block: Block<'a>,
+}
+
+impl FileBlock<'_> {
+    pub fn new<'a>(key: &'a [u8], data: &'a [u8]) -> FileBlock<'a> {
+        let mut res = Self::new_with_params(
+            0,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs(),
+            key.len() as u64,
+            data.len() as u64,
+            key,
+            data,
+        );
+
+        res
+    }
+    pub fn new_with_params<'a>(
+        crc: u32,
+        timestamp: u64,
+        key_size: u64,
+        data_size: u64,
+        key: &'a [u8],
+        data: &'a [u8],
+    ) -> FileBlock<'a> {
+        FileBlock {
+            crc,
+            block: Block::new_with_params(timestamp, key_size, data_size, key, data),
+        }
+    }
+    pub fn crc(&self) -> u32 {
+        self.crc
+    }
+    pub fn timestamp(&self) -> u64 {
+        self.block.timestamp
+    }
+    pub fn key_size(&self) -> u64 {
+        self.block.key_size
+    }
+    pub fn data_size(&self) -> u64 {
+        self.block.data_size
+    }
+    pub fn key(&self) -> &[u8] {
+        &self.block.key
+    }
+    pub fn data(&self) -> &[u8] {
+        &self.block.data
+    }
+}
