@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{IoSlice, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -11,6 +11,7 @@ use std::{result, vec};
 use super::core::{ActiveBlock, BitRecord, BitraskIndex, StillBlock};
 use core::{hash, time};
 use crc32fast::Hasher;
+use serde::de::value;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Error, Read},
@@ -19,7 +20,7 @@ use std::{
 };
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc;
 use tokio::task;
 
@@ -38,6 +39,7 @@ impl CrcCalculator for CustomCrcCalculator {
 /**
  * A Class to handle Block IO asynchronously
  */
+#[derive(Debug)]
 pub struct AsyncBlockIo {
     pub block_dir: String,
     // pub active_block: File,
@@ -63,21 +65,29 @@ impl AsyncBlockIo {
             record_sender,
             max_record_count_in_active_block,
         };
-        let active_block = task::block_in_place(|| {
+        let (active_block, inital_size) = task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(obj.read_active_block())
                 .expect("Failed to read active block when initializing AsyncBlockIo")
         });
+        let active_block_filename = active_block.get_block_index();
+        let dir_cp = dir.to_owned();
         task::spawn(Self::run(
-            dir.to_string(),
+            dir_cp.clone(),
+            PathBuf::from(format!(
+                "{}/{}",
+                dir_cp,
+                Self::u64_to_filename(active_block_filename)
+            )),
             record_receiver,
-            active_block.len(),
+            inital_size,
             max_record_count_in_active_block,
         ));
         (obj, active_block)
     }
     async fn run(
         block_dir: String,
+        active_block_path: PathBuf,
         mut record_receiver: mpsc::Receiver<BitRecord>,
         mut current_record_count_in_active_block: usize,
         max_record_count_in_active_block: usize,
@@ -86,15 +96,23 @@ impl AsyncBlockIo {
             let mut active_block = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(AsyncBlockIo::get_active_filename_with_dir(&block_dir).await?)
+                .open(active_block_path)
                 .await?;
+            // println!("current count: {}", current_record_count_in_active_block);
+            // println!("max count: {}", max_record_count_in_active_block);
             while let Some(record) = record_receiver.recv().await {
                 let len = record.len() as u64;
+                // println!("Record Len: {}", len);
                 let len_bytes = len.to_le_bytes();
+                // println!("Record Len Bytes: {:?}", len_bytes);
                 active_block.write_all(&len_bytes).await.unwrap();
                 active_block.write_all(&record).await.unwrap();
                 active_block.flush().await.unwrap();
                 current_record_count_in_active_block += 1;
+                // println!(
+                //     "write! current count: {}",
+                //     current_record_count_in_active_block
+                // );
                 if current_record_count_in_active_block >= max_record_count_in_active_block {
                     drop(active_block);
                     current_record_count_in_active_block = 0;
@@ -114,40 +132,51 @@ impl AsyncBlockIo {
             eprintln!("Failed to open or create an active block: {}", e);
         }
     }
-    pub fn get_ordered_filename() -> String {
+    pub fn get_timestamp() -> String {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs();
+            .as_millis();
         format!("{:016X}", timestamp)
     }
     pub fn u64_to_filename(u: u64) -> String {
         format!("{:016X}", u)
     }
+    pub fn filename_to_u64(filename: &OsStr) -> u64 {
+        u64::from_str_radix(filename.to_str().unwrap(), 16)
+            .expect("Failed to convert filename to u64")
+    }
     /**
      * it should be the lexicographically largest filename in the directory otherwise returns "a ordered filename"
      */
+
+    pub fn get_order_filename_with_dir(dir: &str) -> String {
+        format!("{}/{}", dir, Self::get_timestamp())
+    }
+    pub fn get_order_filename_in_dir(&self) -> String {
+        format!("{}/{}", self.block_dir, Self::get_timestamp())
+    }
+    pub fn get_path_from_filename(filename: &str) -> PathBuf {
+        PathBuf::from(filename)
+    }
     pub async fn get_active_filename_in_dir(&self) -> io::Result<PathBuf> {
         Self::get_active_filename_with_dir(&self.block_dir).await
     }
-    pub fn get_order_filename_with_dir(dir: &str) -> String {
-        format!("{}/{}", dir, Self::get_ordered_filename())
-    }
-    pub fn get_order_filename_in_dir(&self) -> String {
-        format!("{}/{}", self.block_dir, Self::get_ordered_filename())
-    }
+
     pub async fn get_active_filename_with_dir(dir: &str) -> io::Result<PathBuf> {
         let mut entries = fs::read_dir(dir).await?;
-        let mut max_filename = match entries.next_entry().await? {
-            Some(entry) => entry.path(),
-            None => PathBuf::from(format!("{}/{}", dir, Self::get_ordered_filename())),
-        };
+        let mut max_filename = entries.next_entry().await?;
+        if max_filename.is_none() {
+            return Ok(PathBuf::from(Self::get_order_filename_with_dir(dir)));
+        }
+        let mut max_filename = max_filename.unwrap().path();
         while let Some(entry) = entries.next_entry().await? {
             let filename = entry.path();
-            if (max_filename.lt(&filename)) {
+            if (max_filename.lt(&filename) && filename.ne(&PathBuf::from(format!("{}/bitrask.idx", dir)))) {
                 max_filename = filename;
             }
         }
+        println!("Active Filename: {:?}", max_filename);
         Ok(max_filename)
     }
     pub async fn write_still_block(&self, block: StillBlock, filename: &str) -> io::Result<()> {
@@ -177,14 +206,21 @@ impl AsyncBlockIo {
         tx.send(record).await?;
         Ok(())
     }
-    pub async fn read_still_block(&self, filename: &str) -> io::Result<StillBlock> {
-        let mut file = OpenOptions::new().read(true).open(filename).await?;
+    pub async fn read_still_block(&self, block_index: u64) -> io::Result<StillBlock> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(PathBuf::from(Self::u64_to_filename(block_index)))
+            .await?;
         let mut buff = Vec::new();
         file.read_to_end(&mut buff).await?;
         let mut block = Vec::new();
         let mut ptr = 0;
         while ptr < buff.len() {
-            let len = (u64::from_le_bytes(buff[ptr..ptr + 8].try_into().unwrap())) as usize;
+            let len = (u64::from_le_bytes(
+                buff[ptr..ptr + 8]
+                    .try_into()
+                    .expect("Failed to convert the Record length from bytes"),
+            )) as usize;
             ptr += 8;
             let record: Box<[u8]> = Box::from(&buff[ptr..ptr + len]);
             ptr += len;
@@ -192,26 +228,40 @@ impl AsyncBlockIo {
         }
         Ok(block.into_boxed_slice())
     }
-    pub async fn read_active_block(&self) -> io::Result<ActiveBlock> {
+    pub async fn read_active_block(&self) -> io::Result<(ActiveBlock, usize)> {
         let filename = self.get_active_filename_in_dir().await?;
         let mut file = OpenOptions::new()
             .read(true)
             .create(true)
             .write(true)
-            .open(filename)
+            .open(filename.clone())
             .await?;
+        // println!("Reading Active Block: {:?}", filename);
         let mut buff = Vec::new();
         file.read_to_end(&mut buff).await?;
+        // println!("Read Active Block: {:?}", buff);
         let mut block = Vec::new();
         let mut ptr = 0;
         while ptr < buff.len() {
+            // println!("Read Record Ptr: {:?}", &buff[ptr..ptr + 8].to_vec());
             let len = (u64::from_le_bytes(buff[ptr..ptr + 8].try_into().unwrap())) as usize;
+            // println!("Read Record Len: {}", len);
             ptr += 8;
             let record: Box<[u8]> = Box::from(&buff[ptr..ptr + len]);
             ptr += len;
             block.push(record);
         }
-        Ok(block)
+        let initial_size = block.len();
+        Ok((
+            ActiveBlock::with_vec(
+                Self::filename_to_u64(filename.file_name().expect(&format!(
+                    "读取正在写入的文件{:?}错误,请检查Bitrask数据目录中是否存在无效目录",
+                    filename
+                ))),
+                block,
+            ),
+            initial_size,
+        ))
     }
     pub async fn write_index(&self, index: &BitraskIndex) -> io::Result<()> {
         let encode = bincode::serialize(index).unwrap();
@@ -225,54 +275,21 @@ impl AsyncBlockIo {
         Ok(())
     }
     pub async fn read_index(&self) -> io::Result<BitraskIndex> {
-        let filename = format!("{}/bitrask.idx", self.block_dir);
-        let mut file = OpenOptions::new().read(true).open(filename).await?;
+        let index_path = PathBuf::from(format!("{}/bitrask.idx", self.block_dir));
+        println!("Reading Index: {:?}", index_path,);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open(index_path)
+            .await?;
         let mut buff = Vec::new();
         file.read_to_end(&mut buff).await?;
-        match buff.len() {
-            0 => Ok(BitraskIndex::new()),
-            _ => {
-                let index = bincode::deserialize(&buff).expect("Failed to deserialize index");
-                Ok(index)
-            }
-        }
-    }
-}
-
-pub struct LruCache<K, V> {
-    capacity: usize,
-    map: HashMap<K, V>,
-    order: VecDeque<K>,
-}
-
-impl<K: std::hash::Hash + Eq + Clone, V> LruCache<K, V> {
-    pub fn new(capacity: usize) -> Self {
-        LruCache {
-            capacity,
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    pub fn get(&mut self, key: K) -> Option<&V> {
-        if self.map.contains_key(&key) {
-            self.order.retain(|k| k != &key);
-            self.order.push_front(key.clone());
-            self.map.get(&key)
-        } else {
-            None
-        }
-    }
-
-    pub fn put(&mut self, key: K, value: V) {
-        if self.map.contains_key(&key) {
-            self.order.retain(|k| k != &key);
-        } else if self.map.len() == self.capacity {
-            if let Some(old_key) = self.order.pop_back() {
-                self.map.remove(&old_key);
-            }
-        }
-        self.order.push_front(key.clone());
-        self.map.insert(key, value);
+        let index = match buff.len() {
+            0 => BitraskIndex::new(),
+            _ => bincode::deserialize(&buff).expect("Failed to deserialize index"),
+        };
+        println!("Reading Index Finished");
+        Ok(index)
     }
 }

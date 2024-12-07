@@ -1,14 +1,16 @@
 #![allow(unused)]
 use scc::HashCache;
 use serde::{Deserialize, Serialize};
+use tokio::{runtime::Handle, sync::RwLock, task};
 
-use crate::core::util::{CrcCalculator, CustomCrcCalculator, LruCache};
+use crate::core::util::{CrcCalculator, CustomCrcCalculator};
 use core::{hash, time};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{Error, Read},
     rc::Rc,
     str::Bytes,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -49,6 +51,7 @@ impl Record for BitRecord {
         res.extend_from_slice(data); // data
         let crc_code = CustomCrcCalculator::calculate_crc(&res[4..]);
         res[0..4].copy_from_slice(&crc_code.to_le_bytes());
+        // println!("Record: {:?}", res);
         res.into_boxed_slice()
     }
     fn is_valid(&self) -> bool {
@@ -77,63 +80,84 @@ impl Record for BitRecord {
     }
 }
 
-pub type ActiveBlock = Vec<BitRecord>;
 pub type StillBlock = Box<[BitRecord]>;
 pub trait Block {
     fn get_data(&self, index: usize) -> Option<&[u8]>;
 }
-pub trait AppendableBlock {
-    fn append_record(&mut self, record: BitRecord);
-    fn freeze_block(self) -> StillBlock;
+#[derive(Debug)]
+pub struct ActiveBlock {
+    block_index: u64,
+    block: RwLock<Vec<BitRecord>>,
 }
 impl Block for StillBlock {
     fn get_data(&self, index: usize) -> Option<&[u8]> {
-        let record = self.get(index).expect("record not found");
+        let record = self
+            .get(index)
+            .expect("record not found, maybe index is over this still block");
         match record.is_valid() {
             true => Some(record.data()),
             false => None,
         }
     }
 }
-impl AppendableBlock for ActiveBlock {
-    fn append_record(&mut self, record: BitRecord) {
-        self.push(record);
+impl ActiveBlock {
+    pub fn new(block_index: u64) -> Self {
+        Self {
+            block_index,
+            block: RwLock::new(Vec::new()),
+        }
     }
-    fn freeze_block(self) -> StillBlock {
-        self.into_boxed_slice()
+    pub fn with_vec(block_index: u64, block: Vec<BitRecord>) -> Self {
+        let len = block.len();
+        Self {
+            block_index,
+            block: RwLock::from(block),
+        }
     }
-}
-impl Block for ActiveBlock {
-    fn get_data(&self, index: usize) -> Option<&[u8]> {
-        let record = self
+    pub fn get_block_index(&self) -> u64 {
+        self.block_index
+    }
+    pub async fn append_record(&mut self, record: BitRecord) -> usize {
+        let mut block = self.block.write().await;
+        let len = block.len();
+        block.push(record);
+        len
+    }
+    pub async fn len(&self) -> usize {
+        self.block.read().await.len()
+    }
+    pub async fn get_data(&self, index: usize) -> Option<Box<[u8]>> {
+        let record = self.block.read().await;
+        let record = record
             .get(index)
             .expect("record not found, maybe index is over this active block");
         match record.is_valid() {
-            true => Some(record.data()),
+            true => Some(Box::from(record.data())),
             false => None,
         }
     }
 }
-#[derive(Serialize, Deserialize)]
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct RecordPointer {
-    block_index: String,
+    block_index: u64,
     record_index: usize,
     timestamp: u64,
 }
 impl RecordPointer {
     fn new(block_index: u64, record_index: usize, timestamp: u64) -> Self {
         Self {
-            block_index: AsyncBlockIo::u64_to_filename(block_index),
+            block_index,
             record_index,
             timestamp,
         }
     }
 }
 pub type BitraskIndex = scc::HashMap<Box<[u8]>, RecordPointer>;
-
+#[derive(Debug)]
 pub struct BitraskManager {
     active_block: ActiveBlock,
-    still_block_cache: HashCache<String, StillBlock>,
+    still_block_cache: HashCache<u64, StillBlock>,
     index: BitraskIndex,
     io: AsyncBlockIo,
 }
@@ -146,17 +170,69 @@ impl BitraskManager {
     ) -> Self {
         let (io, active_block) =
             AsyncBlockIo::from(dir, channel_buffer_size, max_record_count_in_active_block);
-
+        let index = task::block_in_place(|| Handle::current().block_on(io.read_index()))
+            .expect("failed to read birask.idx");
         Self {
-            active_block,
+            active_block: active_block,
             still_block_cache: HashCache::with_capacity(0, block_cache_size),
-            index: BitraskIndex::new(),
+            index,
             io,
         }
     }
-    pub fn get_data(&self, key: &[u8]) -> Option<&[u8]> {
-        let pointer = self.index.get(key)?.get();
-        let block = self.still_block_cache.get(&pointer.block_index)?;
-    
+    pub async fn get(&self, key: &[u8]) -> Option<Box<[u8]>> {
+        let ptr = self.index.get(key)?;
+        let ptr = ptr.get();
+        // 检测是否在active_block中
+        if ptr.block_index == self.active_block.get_block_index() {
+            return self.active_block.get_data(ptr.record_index).await;
+        }
+        // 检测是否在still_block_cache中
+        if let Some(block) = self.still_block_cache.get(&ptr.block_index) {
+            return Some(Box::from(block.get().get(ptr.record_index)?.data()));
+        }
+        // 从硬盘中读取,并放入still_block_cache
+        let block = self
+            .io
+            .read_still_block(ptr.block_index)
+            .await
+            .expect(&format!(
+                "block {} not found",
+                AsyncBlockIo::u64_to_filename(ptr.block_index)
+            ));
+        // println!("block: {:?}", block);
+        let data = Box::from(block[ptr.record_index].data());
+        // println!("data: {:?}", data);
+        self.still_block_cache.put_async(ptr.block_index, block);
+        Some(data)
+    }
+    pub async fn put(&mut self, key: &[u8], data: &[u8]) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = BitRecord::new(key, data);
+        let record_index = self.active_block.append_record(record.clone()).await;
+        let block_index = self.active_block.get_block_index();
+        self.io.write_record_into_active_block(record).await;
+        self.index.insert(
+            Box::from(key),
+            RecordPointer::new(block_index, record_index, timestamp),
+        );
+    }
+    pub fn print_index(&self) {
+        println!("index size: {}", self.index.len());
+        // self.index.scan(|key, ptr| {
+        //     println!(
+        //         "key: {:?}, block_index: {}, record_index: {}, timestamp: {}",
+        //         key, ptr.block_index, ptr.record_index, ptr.timestamp
+        //     );
+        // });
+    }
+}
+impl Drop for BitraskManager {
+    fn drop(&mut self) {
+        task::block_in_place(|| {
+            Handle::current().block_on(self.io.write_index(&self.index));
+        });
     }
 }
