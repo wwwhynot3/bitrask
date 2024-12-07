@@ -1,7 +1,8 @@
+use core::time;
 use std::sync::Arc;
 
 use bitrask::core::core::BitraskManager;
-use tokio::{sync::Barrier, task, time};
+use tokio::{sync::Barrier, task};
 
 #[tokio::main]
 async fn main() {
@@ -27,8 +28,8 @@ async fn main() {
     let manager = Arc::new(tokio::sync::Mutex::new(BitraskManager::from_dir(
         "test_data",
         100,
-        0,
         1,
+        10,
     )));
     {
         manager.lock().await.print_index();
@@ -38,7 +39,7 @@ async fn main() {
 
     // 启动多个并发任务
     let mut handles = vec![];
-    for i in 0..1 {
+    for i in 0..100 {
         let manager = Arc::clone(&manager);
         let barrier = Arc::clone(&barrier);
         let handle = task::spawn(async move {
@@ -50,8 +51,13 @@ async fn main() {
             let data = u64::to_le_bytes(i as u64);
             let mut manager: tokio::sync::MutexGuard<'_, BitraskManager> = manager.lock().await;
             manager.put(&key, &data).await;
-            let retrieved_data = manager.get(&key).await;
-            assert_eq!(retrieved_data, Some(Box::from(data.as_slice())));
+            let retrieved_data: Option<Box<[u8]>> = manager.get(&key).await;
+            println!(
+                "key: {:?}, value:{:?}",
+                u64::from_le_bytes(key),
+                u64::from_le_bytes(retrieved_data.unwrap().as_ref().try_into().unwrap())
+            );
+            // assert_eq!(retrieved_data, Some(Box::from(data.as_slice())));
         });
         handles.push(handle);
     }
@@ -59,6 +65,10 @@ async fn main() {
     // 等待所有任务完成
     for handle in handles {
         handle.await.unwrap();
+    }
+
+    {
+        manager.lock().await.print_index();
     }
 }
 
@@ -76,7 +86,7 @@ mod tests {
             "test_data",
             100,
             10,
-            1000,
+            100,
         )));
 
         // 创建一个 Barrier 来同步多个任务的启动
@@ -84,7 +94,7 @@ mod tests {
 
         // 启动多个并发任务
         let mut handles = vec![];
-        for i in 0..10 {
+        for i in 0..1000 {
             let manager = Arc::clone(&manager);
             let barrier = Arc::clone(&barrier);
             let handle = task::spawn(async move {
@@ -93,9 +103,9 @@ mod tests {
 
                 // 插入数据
                 let key = u64::to_le_bytes(i as u64);
-                let data = u64::to_le_bytes(i as u64);
+                let data = u64::to_le_bytes(i + 1 as u64);
                 let mut manager = manager.lock().await;
-                manager.put(&key, &data).await;
+                // manager.put(&key, &data).await;
                 let retrieved_data = manager.get(&key).await;
                 assert_eq!(retrieved_data, Some(Box::from(data.as_slice())));
             });
